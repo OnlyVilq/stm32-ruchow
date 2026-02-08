@@ -1,0 +1,12 @@
+# Pliki i katalogi generowane przez Cargo
+/target/
+Cargo.lock
+
+# Pliki tymczasowe i kopie zapasowe
+*.bak
+*.csv
+*.lua
+
+# Pliki specyficzne dla środowiska programistycznego (opcjonalnie)
+.idea/
+.vscode/
