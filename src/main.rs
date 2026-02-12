@@ -10,12 +10,20 @@ use hal::{
 
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
-use core::sync::atomic::{AtomicU32, Ordering};
+use portable_atomic::{AtomicU32, Ordering};
 use core::ptr::addr_of_mut;
 
 use defmt_rtt as _;
 use panic_probe as _;
 use defmt::*;
+
+//includowanie convertera
+mod converter;
+use converter::{
+    converter,
+    STEPS
+};
+
 
 // --- ZMIENNE GLOBALNE ---
 static G_TIM3: Mutex<RefCell<Option<pac::TIM3>>> = Mutex::new(RefCell::new(None));
@@ -25,6 +33,9 @@ static STEPS_LEFT_2: AtomicU32 = AtomicU32::new(0);
 
 // Bufor na 11 bajtów: [0xFF, 0xFE, A0, A0, A0, A0, A1, A1, A1, A1, 0xFD]
 static mut RX_BUFFER: [u8; 11] = [0u8; 11];
+
+//ZMIENNA DLA KONWERSJI U32 W KROKI
+static LASTPOS: AtomicU32 = AtomicU32::new(STEPS/2); //zakładany że silnik jest zbazowany,
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
@@ -119,6 +130,10 @@ fn main() -> ! {
             if buffer[0] == 0xff && buffer[1] == 0xfe && buffer[10] == 0xfd {
                 let a0 = u32::from_le_bytes([buffer[2], buffer[3], buffer[4], buffer[5]]);
                 let a1 = u32::from_le_bytes([buffer[6], buffer[7], buffer[8], buffer[9]]);
+
+                //tutaj dodać convertery do przeliczenia pozycji na kroki
+                //dodać też odpowiednie piny do wstecznego i ewentualnie handlowanie
+                //błędów z sterownika silnika krokowego
                 
                 info!("Command: Axis0={}, Axis1={}", a0, a1);
                 start_motor_3(a0);

@@ -26,6 +26,7 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 stm32g0xx-hal = { git = "https://github.com/stm32-rs/stm32g0xx-hal.git", features = ["stm32g031", "rt"] }
 embedded-hal = "1.0"
 critical-section = "1.1"
+portable-atomic = { version = "1", features = ["critical-section"] }
 
 [dev-dependencies]
 defmt-test = "0.3"
