@@ -24,6 +24,14 @@ use converter::{
     STEPS
 };
 
+// --- piny
+// PA0	Silnik 2 (STEP)	TIM2_CH1 (AF2)	Wejście STEP (PUL) sterownika silnika nr 2
+// PA7	Silnik 3 (STEP)	TIM3_CH2 (AF1)	Wejście STEP (PUL) sterownika silnika nr 3
+// PA9	UART TX	USART1_TX (AF1)	Do RX konwertera USB-UART lub innego mikrokontrolera
+// PA10	UART RX	USART1_RX (AF1)	Do TX konwertera USB-UART (tędy wchodzą dane DMA)
+// PB0
+// PB1
+
 
 // --- ZMIENNE GLOBALNE ---
 static G_TIM3: Mutex<RefCell<Option<pac::TIM3>>> = Mutex::new(RefCell::new(None));
@@ -34,9 +42,6 @@ static STEPS_LEFT_2: AtomicU32 = AtomicU32::new(0);
 // Bufor na 11 bajtów: [0xFF, 0xFE, A0, A0, A0, A0, A1, A1, A1, A1, 0xFD]
 static mut RX_BUFFER: [u8; 11] = [0u8; 11];
 
-//ZMIENNA DLA KONWERSJI U32 W KROKI
-static LASTPOS: AtomicU32 = AtomicU32::new(STEPS/2); //zakładany że silnik jest zbazowany,
-
 #[cortex_m_rt::entry]
 fn main() -> ! {
     info!("Stepper System Booting...");
@@ -46,6 +51,30 @@ fn main() -> ! {
     // --- 1. RCC & GPIOA (PAC) ---
     let rcc_ptr = pac::RCC::ptr();
     let gpioa_ptr = pac::GPIOA::ptr();
+    let gpiob_ptr = pac::GPIOB::ptr();
+
+    unsafe {
+        // Włączamy zegar dla GPIOA ORAZ GPIOB (bit IOPBEN)
+        (*rcc_ptr).iopenr().modify(|_, w| w.iopaen().set_bit().iopben().set_bit());
+        
+        (*rcc_ptr).ahbenr().modify(|_, w| w.dmaen().set_bit());
+
+        // ... twoja konfiguracja GPIOA ...
+
+        // --- KONFIGURACJA PB0 i PB1 ---
+        // MODER: 01 = Output mode
+        (*gpiob_ptr).moder().modify(|_, w| {
+            w.moder0().bits(0b01) // PB0 jako wyjście
+             .moder1().bits(0b01) // PB1 jako wyjście
+        });
+
+        // OTYPER: 0 = Push-Pull (to jest domyślne po resecie, ale warto ustawić jawnie)
+        (*gpiob_ptr).otyper().modify(|_, w| {
+            w.ot0().push_pull() // PB0 Push-Pull
+             .ot1().push_pull() // PB1 Push-Pull
+        });
+    }
+
     unsafe {
         (*rcc_ptr).iopenr().modify(|_, w| w.iopaen().set_bit());
         (*rcc_ptr).ahbenr().modify(|_, w| w.dmaen().set_bit());
@@ -78,7 +107,15 @@ fn main() -> ! {
     }
 
     let _clocks = rcc.freeze(hal::rcc::Config::default());
-
+    
+    unsafe {
+        let rcc_ptr = pac::RCC::ptr();
+        // TIM2 i TIM3 znajdują się na szynie APB (rejestr APBENR1)
+        (*rcc_ptr).apbenr1().modify(|_, w| {
+            w.tim2en().set_bit() // Włącz zegar TIM2
+             .tim3en().set_bit() // Włącz zegar TIM3
+        });
+    }
     // --- 3. DMA & DMAMUX (PAC) ---
     unsafe {
         dp.DMAMUX.ccr(0).write(|w| w.dmareq_id().bits(50)); // 50 = USART1_RX
@@ -90,22 +127,25 @@ fn main() -> ! {
         ch1.cr().write(|w| w.minc().set_bit().en().set_bit());
     }
 
-    // --- 4. TIMERY (PAC) ---
-    let tim3 = dp.TIM3;
-    tim3.psc().write(|w| unsafe { w.bits(15) });
-    tim3.arr().write(|w| unsafe { w.arr().bits(1000) });
-    tim3.ccr2().write(|w| unsafe { w.ccr().bits(500) });
+let tim3 = dp.TIM3;
+    // HSI = 16MHz. PSC = 15 => Zegar Timera = 1 MHz (1 us)
+    tim3.psc().write(|w| unsafe { w.bits(15) }); 
+    tim3.arr().write(|w| unsafe { w.arr().bits(16000) }); // Wartość startowa bezpieczna
+    tim3.ccr2().write(|w| unsafe { w.ccr().bits(100) }); // Wartość startowa
     tim3.ccmr1_output().modify(|_, w| unsafe { w.oc2m().bits(0b110).oc2pe().set_bit() });
     tim3.ccer().modify(|_, w| w.cc2e().set_bit());
     tim3.dier().write(|w| w.uie().set_bit());
+    // WAŻNE: Wymuś update event, aby załadować PSC do rejestru cienia
+    tim3.egr().write(|w| w.ug().set_bit()); 
 
     let tim2 = dp.TIM2;
-    tim2.psc().write(|w| unsafe { w.bits(15) });
-    tim2.arr().write(|w| unsafe { w.bits(2000) });
-    tim2.ccr1().write(|w| unsafe { w.bits(1000) });
+    tim2.psc().write(|w| unsafe { w.bits(15) }); // 1 MHz
+    tim2.arr().write(|w| unsafe { w.bits(16000) });
+    tim2.ccr1().write(|w| unsafe { w.bits(100) });
     tim2.ccmr1_output().modify(|_, w| unsafe { w.oc1m().bits(0b110).oc1pe().set_bit() });
     tim2.ccer().modify(|_, w| w.cc1e().set_bit());
     tim2.dier().write(|w| w.uie().set_bit());
+    tim2.egr().write(|w| w.ug().set_bit());
 
     cortex_m::interrupt::free(|cs| {
         G_TIM3.borrow(cs).replace(Some(tim3));
@@ -118,6 +158,9 @@ fn main() -> ! {
     }
 
     info!("System up and running. Awaiting UART...");
+
+    static LAST_POS0: AtomicU32 = AtomicU32::new(STEPS/2);
+    static LAST_POS1: AtomicU32 = AtomicU32::new(STEPS/2);
 
     loop {
         // Sprawdzenie czy DMA skończyło (odebrano 11 bajtów)
@@ -135,9 +178,31 @@ fn main() -> ! {
                 //dodać też odpowiednie piny do wstecznego i ewentualnie handlowanie
                 //błędów z sterownika silnika krokowego
                 
-                info!("Command: Axis0={}, Axis1={}", a0, a1);
-                start_motor_3(a0);
-                start_motor_2(a1);
+                let (steps0, rev0) = converter(&LAST_POS0,a0);
+                let (steps1, rev1) = converter(&LAST_POS1,a1);
+                
+
+                unsafe {
+                    let gpiob = pac::GPIOB::ptr();
+
+                    // Obsługa kierunku dla Silnika 2 (PB0)
+                    if rev0 {
+                        (*gpiob).bsrr().write(|w| w.bs0().set_bit()); // PB0 HIGH
+                    } else {
+                        (*gpiob).bsrr().write(|w| w.br0().set_bit()); // PB0 LOW
+                    }
+
+                    // Obsługa kierunku dla Silnika 3 (PB1)
+                    if rev1 {
+                        (*gpiob).bsrr().write(|w| w.bs1().set_bit()); // PB1 HIGH
+                    } else {
+                        (*gpiob).bsrr().write(|w| w.br1().set_bit()); // PB1 LOW
+                    }
+                }
+
+                info!("Command: Axis0={}, Axis1={}", steps0, steps1);
+                start_motor_3(steps0);
+                start_motor_2(steps1);
             } else {
                 warn!("Invalid frame received!");
             }
@@ -177,54 +242,145 @@ fn USART1() {
     }
 }
 
+// --- POPRAWIONE FUNKCJE STARTUJĄCE SILNIKI ---
+
+// Stała: Liczba cykli zegara 1MHz w czasie 16ms
+const TICKS_PER_FRAME: u32 = 16_000; 
+// Minimalne ARR - zabezpieczenie przed zawieszeniem CPU (np. ARR=1 dałoby 500kHz przerwań)
+// ARR=40 daje max 25kHz steps/sec. Zmniejsz jeśli masz szybkie silniki i pewny zegar.
+const MIN_ARR: u32 = 40; 
+
 fn start_motor_3(steps: u32) {
-    if steps == 0 { return; }
-    STEPS_LEFT_3.store(steps, Ordering::SeqCst);
     cortex_m::interrupt::free(|cs| {
         if let Some(tim3) = G_TIM3.borrow(cs).borrow().as_ref() {
+            // 1. Zawsze najpierw zatrzymujemy timer
+            tim3.cr1().modify(|_, w| w.cen().clear_bit());
+            
+            // 2. Jeśli brak kroków, kończymy (timer zostaje wyłączony)
+            if steps == 0 {
+                return;
+            }
+
+            // 3. Obliczamy ARR, aby ruch trwał ok. 16ms
+            // Wzór: ARR = (TotalTime / Steps) - 1
+            let mut arr = TICKS_PER_FRAME / steps;
+            
+            // Zabezpieczenie przed zbyt dużą prędkością (zbyt małym ARR)
+            if arr < MIN_ARR {
+                arr = MIN_ARR; 
+                // Opcjonalnie: warn!("Speed Limit hit on M3!");
+            }
+            // Zabezpieczenie dla TIM3 (16-bit)
+            if arr > 0xFFFF {
+                arr = 0xFFFF;
+            }
+
+            // 4. Ustawiamy rejestry (ARR ustala częstotliwość, CCR wypełnienie ~50%)
+            // Odejmujemy 1, bo licznik liczy od 0 do ARR
+            let arr_val = (arr - 1) as u16;
+            
+            tim3.arr().write(|w| unsafe { w.arr().bits(arr_val) });
+            tim3.ccr2().write(|w| unsafe { w.ccr().bits(arr_val / 2) }); // 50% duty cycle
+
+            // 5. Reset licznika i flag
             tim3.cnt().write(|w| unsafe { w.bits(0) });
+            STEPS_LEFT_3.store(steps, Ordering::SeqCst);
+            tim3.sr().write(|w| w.uif().clear_bit());
+
+            // 6. Start
             tim3.cr1().modify(|_, w| w.cen().set_bit());
         }
     });
 }
 
 fn start_motor_2(steps: u32) {
-    if steps == 0 { return; }
-    STEPS_LEFT_2.store(steps, Ordering::SeqCst);
     cortex_m::interrupt::free(|cs| {
         if let Some(tim2) = G_TIM2.borrow(cs).borrow().as_ref() {
+            tim2.cr1().modify(|_, w| w.cen().clear_bit());
+            
+            if steps == 0 { return; }
+
+            let mut arr = TICKS_PER_FRAME / steps;
+            if arr < MIN_ARR { arr = MIN_ARR; }
+            // TIM2 jest 32-bitowy, więc nie musimy martwić się o górny limit tak bardzo jak w TIM3,
+            // ale dla zachowania spójności czasowej max to i tak ~16ms.
+            
+            let arr_val = arr - 1;
+
+            tim2.arr().write(|w| unsafe { w.bits(arr_val) });
+            tim2.ccr1().write(|w| unsafe { w.bits(arr_val / 2) });
+
             tim2.cnt().write(|w| unsafe { w.bits(0) });
+            STEPS_LEFT_2.store(steps, Ordering::SeqCst);
+            tim2.sr().write(|w| w.uif().clear_bit());
+            
             tim2.cr1().modify(|_, w| w.cen().set_bit());
         }
     });
 }
 
+
+// --- POPRAWIONE OBSŁUGI PRZERWAŃ ---
+
+// #[interrupt]
+// fn TIM3() {
+//     cortex_m::interrupt::free(|cs| {
+//         if let Some(tim3) = G_TIM3.borrow(cs).borrow().as_ref() {
+//             // Czyścimy flagę poprzez write (bezpieczniej dla rc_w0)
+//             tim3.sr().write(|w| w.uif().clear_bit());
+            
+//             let steps = STEPS_LEFT_3.load(Ordering::SeqCst);
+//             if steps > 0 {
+//                 STEPS_LEFT_3.store(steps - 1, Ordering::SeqCst);
+//             } else {
+//                 // Jeśli kroki się skończyły, wyłączamy timer
+//                 tim3.cr1().modify(|_, w| w.cen().clear_bit());
+//             }
+//         }
+//     });
+// }
+
 #[interrupt]
 fn TIM3() {
     cortex_m::interrupt::free(|cs| {
         if let Some(tim3) = G_TIM3.borrow(cs).borrow().as_ref() {
-            tim3.sr().modify(|_, w| w.uif().clear_bit());
+            // Write 0 to clear (najbezpieczniejsza metoda)
+            tim3.sr().write(|w| w.uif().clear_bit());
+            
             let steps = STEPS_LEFT_3.load(Ordering::SeqCst);
-            if steps > 0 {
+            if steps > 1 {
+                // Jeśli zostało więcej niż 1 krok, dekrementujemy
                 STEPS_LEFT_3.store(steps - 1, Ordering::SeqCst);
             } else {
+                // Ostatni krok wykonany (lub było 0) -> Stop
                 tim3.cr1().modify(|_, w| w.cen().clear_bit());
+                // Ustawiamy na 0 dla porządku
+                STEPS_LEFT_3.store(0, Ordering::SeqCst);
             }
         }
     });
 }
+// Analogicznie dla TIM2...
+
 
 #[interrupt]
 fn TIM2() {
     cortex_m::interrupt::free(|cs| {
         if let Some(tim2) = G_TIM2.borrow(cs).borrow().as_ref() {
-            tim2.sr().modify(|_, w| w.uif().clear_bit());
+            // Write 0 to clear (najbezpieczniejsza metoda)
+            tim2.sr().write(|w| w.uif().clear_bit());
+            
             let steps = STEPS_LEFT_2.load(Ordering::SeqCst);
-            if steps > 0 {
+            if steps > 1 {
+                // Jeśli zostało więcej niż 1 krok, dekrementujemy
                 STEPS_LEFT_2.store(steps - 1, Ordering::SeqCst);
             } else {
+                // Ostatni krok wykonany (lub było 0) -> Stop
                 tim2.cr1().modify(|_, w| w.cen().clear_bit());
+                // Ustawiamy na 0 dla porządku
+                STEPS_LEFT_2.store(0, Ordering::SeqCst);
             }
         }
     });
 }
+// Analogicznie dla TIM2...
