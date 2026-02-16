@@ -102,7 +102,11 @@ fn main() -> ! {
     unsafe {
         let usart1 = &*pac::USART1::ptr();
         usart1.cr3().modify(|_, w| w.dmar().set_bit());   // To pozwala UARTowi prosić DMA o transfer
-        usart1.cr1().modify(|_, w| w.idleie().set_bit()); // To włącza detekcję końca ramki
+        //usart1.cr1().modify(|_, w| w.idleie().set_bit()); // To włącza detekcję końca ramki
+        usart1.rtor().write(|w| w.rto().bits(1152));
+        usart1.cr2().modify(|_, w| w.rtoen().set_bit());
+        usart1.cr1().modify(|_, w| w.rtoie().set_bit());
+
         pac::NVIC::unmask(pac::Interrupt::USART1);
     }
 
@@ -130,8 +134,8 @@ fn main() -> ! {
 let tim3 = dp.TIM3;
     // HSI = 16MHz. PSC = 15 => Zegar Timera = 1 MHz (1 us)
     tim3.psc().write(|w| unsafe { w.bits(15) }); 
-    tim3.arr().write(|w| unsafe { w.arr().bits(16000) }); // Wartość startowa bezpieczna
-    tim3.ccr2().write(|w| unsafe { w.ccr().bits(100) }); // Wartość startowa
+    tim3.arr().write(|w| unsafe { w.arr().bits(8000) }); // Wartość startowa bezpieczna
+    tim3.ccr2().write(|w| unsafe { w.ccr().bits(200) }); // Wartość startowa
     tim3.ccmr1_output().modify(|_, w| unsafe { w.oc2m().bits(0b110).oc2pe().set_bit() });
     tim3.ccer().modify(|_, w| w.cc2e().set_bit());
     tim3.dier().write(|w| w.uie().set_bit());
@@ -140,8 +144,8 @@ let tim3 = dp.TIM3;
 
     let tim2 = dp.TIM2;
     tim2.psc().write(|w| unsafe { w.bits(15) }); // 1 MHz
-    tim2.arr().write(|w| unsafe { w.bits(16000) });
-    tim2.ccr1().write(|w| unsafe { w.bits(100) });
+    tim2.arr().write(|w| unsafe { w.bits(8000) });
+    tim2.ccr1().write(|w| unsafe { w.bits(200) });
     tim2.ccmr1_output().modify(|_, w| unsafe { w.oc1m().bits(0b110).oc1pe().set_bit() });
     tim2.ccer().modify(|_, w| w.cc1e().set_bit());
     tim2.dier().write(|w| w.uie().set_bit());
@@ -164,11 +168,11 @@ let tim3 = dp.TIM3;
 
     loop {
         // Sprawdzenie czy DMA skończyło (odebrano 11 bajtów)
-        if unsafe { dp.DMA1.isr().read().tcif1().bit_is_set() } {
-            unsafe { dp.DMA1.ifcr().write(|w| w.ctcif1().set_bit()); }
+        if dp.DMA1.isr().read().tcif1().bit_is_set() {
+            dp.DMA1.ifcr().write(|w| w.ctcif1().set_bit()); 
 
             let buffer = unsafe { *addr_of_mut!(RX_BUFFER) };
-            info!("UART RX: {:x}", buffer);
+            //info!("UART RX: {:x}", buffer);
 
             if buffer[0] == 0xff && buffer[1] == 0xfe && buffer[10] == 0xfd {
                 let a0 = u32::from_be_bytes([buffer[2], buffer[3], buffer[4], buffer[5]]);
@@ -200,7 +204,7 @@ let tim3 = dp.TIM3;
                     }
                 }
 
-                info!("Command: Axis0={}, Axis1={}", steps0, steps1);
+                //info!("Command: Axis0={}, Axis1={}", steps0, steps1);
                 start_motor_3(steps0);
                 start_motor_2(steps1);
             } else {
@@ -230,12 +234,20 @@ fn restart_dma() {
 fn USART1() {
     unsafe {
         let dp = pac::Peripherals::steal();
-        if dp.USART1.isr().read().idle().bit_is_set() {
-            dp.USART1.icr().write(|w| w.idlecf().set_bit()); // Czyścimy flagę IDLE
+        let isr = dp.USART1.isr().read();
+
+        // Sprawdzamy flagę RTOF (Receiver Timeout) zamiast IDLE
+        if isr.rtof().bit_is_set() {
+            // Czyścimy flagę RTO (bit RTOCF w rejestrze ICR)
+            dp.USART1.icr().write(|w| w.rtocf().set_bit());
             
+            // Logika taka sama: sprawdzamy ile zostało w DMA
             let left = dp.DMA1.ch1().ndtr().read().ndt().bits();
+            
+            // Jeśli RTO wystąpiło, a bufor nie jest pełny (czyli DMA nie zdążyło pobrać 11 bajtów)
+            // to znaczy, że transmisja się urwała w połowie.
             if left > 0 && left < 11 {
-                warn!("IDLE detected, frame incomplete. Resetting DMA...");
+                warn!("RTO (Timeout) detected, incomplete frame (left: {}). Resetting DMA...", left);
                 restart_dma();
             }
         }
@@ -245,10 +257,10 @@ fn USART1() {
 // --- POPRAWIONE FUNKCJE STARTUJĄCE SILNIKI ---
 
 // Stała: Liczba cykli zegara 1MHz w czasie 16ms
-const TICKS_PER_FRAME: u32 = 16_000; 
+const TICKS_PER_FRAME: u32 = 19_000; 
 // Minimalne ARR - zabezpieczenie przed zawieszeniem CPU (np. ARR=1 dałoby 500kHz przerwań)
 // ARR=40 daje max 25kHz steps/sec. Zmniejsz jeśli masz szybkie silniki i pewny zegar.
-const MIN_ARR: u32 = 40; 
+const MIN_ARR: u32 = 80; 
 
 fn start_motor_3(steps: u32) {
     cortex_m::interrupt::free(|cs| {

@@ -1,6 +1,6 @@
 use portable_atomic::{AtomicU32, Ordering};
 
-pub const STEPS:u32 = 40000;
+pub const STEPS:u32 = 8000;
 
 fn step_converter(position: u32) -> u32 {
 
