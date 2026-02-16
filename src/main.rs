@@ -171,8 +171,8 @@ let tim3 = dp.TIM3;
             info!("UART RX: {:x}", buffer);
 
             if buffer[0] == 0xff && buffer[1] == 0xfe && buffer[10] == 0xfd {
-                let a0 = u32::from_le_bytes([buffer[2], buffer[3], buffer[4], buffer[5]]);
-                let a1 = u32::from_le_bytes([buffer[6], buffer[7], buffer[8], buffer[9]]);
+                let a0 = u32::from_be_bytes([buffer[2], buffer[3], buffer[4], buffer[5]]);
+                let a1 = u32::from_be_bytes([buffer[6], buffer[7], buffer[8], buffer[9]]);
 
                 //tutaj dodać convertery do przeliczenia pozycji na kroki
                 //dodać też odpowiednie piny do wstecznego i ewentualnie handlowanie
