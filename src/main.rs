@@ -25,12 +25,12 @@ use converter::{
 };
 
 // --- piny
-// PA0	Silnik 2 (STEP)	TIM2_CH1 (AF2)	Wejście STEP (PUL) sterownika silnika nr 2
-// PA7	Silnik 3 (STEP)	TIM3_CH2 (AF1)	Wejście STEP (PUL) sterownika silnika nr 3
-// PA9	UART TX	USART1_TX (AF1)	Do RX konwertera USB-UART lub innego mikrokontrolera
-// PA10	UART RX	USART1_RX (AF1)	Do TX konwertera USB-UART (tędy wchodzą dane DMA)
-// PB0
-// PB1
+// PA0	Silnik 2 (STEP)	TIM2_CH1 (AF2)	
+// PA7	Silnik 3 (STEP)	TIM3_CH2 (AF1)	
+// PA9	UART TX	USART1_TX (AF1)	
+// PA10	UART RX	USART1_RX (AF1)
+// PB0 Silnik 2 (REV)
+// PB1 Silnik 3 (REV)
 
 
 // --- ZMIENNE GLOBALNE ---
@@ -48,18 +48,16 @@ fn main() -> ! {
 
     let dp = pac::Peripherals::take().unwrap();
     
-    // --- 1. RCC & GPIOA (PAC) ---
+    // --- RCC & GPIOA (PAC) ---
     let rcc_ptr = pac::RCC::ptr();
     let gpioa_ptr = pac::GPIOA::ptr();
     let gpiob_ptr = pac::GPIOB::ptr();
 
     unsafe {
-        // Włączamy zegar dla GPIOA ORAZ GPIOB (bit IOPBEN)
+        // zegar dla GPIOA ORAZ GPIOB (bit IOPBEN)
         (*rcc_ptr).iopenr().modify(|_, w| w.iopaen().set_bit().iopben().set_bit());
         
         (*rcc_ptr).ahbenr().modify(|_, w| w.dmaen().set_bit());
-
-        // ... twoja konfiguracja GPIOA ...
 
         // --- KONFIGURACJA PB0 i PB1 ---
         // MODER: 01 = Output mode
@@ -87,7 +85,7 @@ fn main() -> ! {
         (*gpioa_ptr).afrh().modify(|_, w| w.afrel9().bits(1).afrel10().bits(1));
     }
 
-    // --- 2. KONFIGURACJA HAL ---
+    // --- KONFIGURACJA HAL ---
     let mut rcc = dp.RCC.constrain();
     let gpioa_hal = dp.GPIOA.split(&mut rcc);
     
@@ -98,10 +96,10 @@ fn main() -> ! {
         &mut rcc,
     ).unwrap();
 
-    // !!! KLUCZOWE: Włączamy komunikację UART -> DMA oraz przerwanie IDLE !!!
+    // --- komunikacja UART ---
     unsafe {
         let usart1 = &*pac::USART1::ptr();
-        usart1.cr3().modify(|_, w| w.dmar().set_bit());   // To pozwala UARTowi prosić DMA o transfer
+        usart1.cr3().modify(|_, w| w.dmar().set_bit()); 
         //usart1.cr1().modify(|_, w| w.idleie().set_bit()); // To włącza detekcję końca ramki
         usart1.rtor().write(|w| w.rto().bits(1152));
         usart1.cr2().modify(|_, w| w.rtoen().set_bit());
@@ -112,6 +110,7 @@ fn main() -> ! {
 
     let _clocks = rcc.freeze(hal::rcc::Config::default());
     
+    // --- uruchomienie timmerów ---
     unsafe {
         let rcc_ptr = pac::RCC::ptr();
         // TIM2 i TIM3 znajdują się na szynie APB (rejestr APBENR1)
@@ -163,6 +162,9 @@ let tim3 = dp.TIM3;
 
     info!("System up and running. Awaiting UART...");
 
+
+    // === TO DO ===
+    // bazowanie na wiare przerobić na czujniki halla
     static LAST_POS0: AtomicU32 = AtomicU32::new(STEPS/2);
     static LAST_POS1: AtomicU32 = AtomicU32::new(STEPS/2);
 
@@ -177,10 +179,9 @@ let tim3 = dp.TIM3;
             if buffer[0] == 0xff && buffer[1] == 0xfe && buffer[10] == 0xfd {
                 let a0 = u32::from_be_bytes([buffer[2], buffer[3], buffer[4], buffer[5]]);
                 let a1 = u32::from_be_bytes([buffer[6], buffer[7], buffer[8], buffer[9]]);
-
-                //tutaj dodać convertery do przeliczenia pozycji na kroki
-                //dodać też odpowiednie piny do wstecznego i ewentualnie handlowanie
-                //błędów z sterownika silnika krokowego
+                
+                //=== TO DO ===
+                //zostały wolne piny, dodać handlowanie błędów sterownika
                 
                 let (steps0, rev0) = converter(&LAST_POS0,a0);
                 let (steps1, rev1) = converter(&LAST_POS1,a1);
@@ -217,8 +218,6 @@ let tim3 = dp.TIM3;
         cortex_m::asm::wfi();
     }
 }
-
-// --- FUNKCJE POMOCNICZE ---
 
 fn restart_dma() {
     unsafe {
@@ -265,41 +264,41 @@ const MIN_ARR: u32 = 80;
 fn start_motor_3(steps: u32) {
     cortex_m::interrupt::free(|cs| {
         if let Some(tim3) = G_TIM3.borrow(cs).borrow().as_ref() {
-            // 1. Zawsze najpierw zatrzymujemy timer
+            // zatrzymanie timmera
             tim3.cr1().modify(|_, w| w.cen().clear_bit());
             
-            // 2. Jeśli brak kroków, kończymy (timer zostaje wyłączony)
+            // timmer zostaje wyłączone jeśli nie podano kroków
             if steps == 0 {
                 return;
             }
 
-            // 3. Obliczamy ARR, aby ruch trwał ok. 16ms
+            // Obliczamy ARR, aby ruch trwał ok. 16ms
             // Wzór: ARR = (TotalTime / Steps) - 1
             let mut arr = TICKS_PER_FRAME / steps;
             
             // Zabezpieczenie przed zbyt dużą prędkością (zbyt małym ARR)
             if arr < MIN_ARR {
                 arr = MIN_ARR; 
-                // Opcjonalnie: warn!("Speed Limit hit on M3!");
+                warn!("Speed Limit hit on M3!");
             }
             // Zabezpieczenie dla TIM3 (16-bit)
             if arr > 0xFFFF {
                 arr = 0xFFFF;
             }
 
-            // 4. Ustawiamy rejestry (ARR ustala częstotliwość, CCR wypełnienie ~50%)
+            // rejestry (ARR ustala częstotliwość, CCR wypełnienie ~50%)
             // Odejmujemy 1, bo licznik liczy od 0 do ARR
             let arr_val = (arr - 1) as u16;
             
             tim3.arr().write(|w| unsafe { w.arr().bits(arr_val) });
             tim3.ccr2().write(|w| unsafe { w.ccr().bits(arr_val / 2) }); // 50% duty cycle
 
-            // 5. Reset licznika i flag
+            // Reset licznika i flag
             tim3.cnt().write(|w| unsafe { w.bits(0) });
             STEPS_LEFT_3.store(steps, Ordering::SeqCst);
             tim3.sr().write(|w| w.uif().clear_bit());
 
-            // 6. Start
+            // Start
             tim3.cr1().modify(|_, w| w.cen().set_bit());
         }
     });
@@ -313,9 +312,10 @@ fn start_motor_2(steps: u32) {
             if steps == 0 { return; }
 
             let mut arr = TICKS_PER_FRAME / steps;
-            if arr < MIN_ARR { arr = MIN_ARR; }
-            // TIM2 jest 32-bitowy, więc nie musimy martwić się o górny limit tak bardzo jak w TIM3,
-            // ale dla zachowania spójności czasowej max to i tak ~16ms.
+            if arr < MIN_ARR {
+                arr = MIN_ARR; 
+                warn!("Speed Limit hit on M3!");
+            }
             
             let arr_val = arr - 1;
 
@@ -332,25 +332,10 @@ fn start_motor_2(steps: u32) {
 }
 
 
-// --- POPRAWIONE OBSŁUGI PRZERWAŃ ---
+// --- OBSŁUGI PRZERWAŃ ---
 
-// #[interrupt]
-// fn TIM3() {
-//     cortex_m::interrupt::free(|cs| {
-//         if let Some(tim3) = G_TIM3.borrow(cs).borrow().as_ref() {
-//             // Czyścimy flagę poprzez write (bezpieczniej dla rc_w0)
-//             tim3.sr().write(|w| w.uif().clear_bit());
-            
-//             let steps = STEPS_LEFT_3.load(Ordering::SeqCst);
-//             if steps > 0 {
-//                 STEPS_LEFT_3.store(steps - 1, Ordering::SeqCst);
-//             } else {
-//                 // Jeśli kroki się skończyły, wyłączamy timer
-//                 tim3.cr1().modify(|_, w| w.cen().clear_bit());
-//             }
-//         }
-//     });
-// }
+
+//timmer3, odliczanie pozostałych kroków
 
 #[interrupt]
 fn TIM3() {
@@ -372,27 +357,22 @@ fn TIM3() {
         }
     });
 }
-// Analogicznie dla TIM2...
 
+//timmer2, odliczanie pozostałych kroków
 
 #[interrupt]
 fn TIM2() {
     cortex_m::interrupt::free(|cs| {
         if let Some(tim2) = G_TIM2.borrow(cs).borrow().as_ref() {
-            // Write 0 to clear (najbezpieczniejsza metoda)
             tim2.sr().write(|w| w.uif().clear_bit());
             
             let steps = STEPS_LEFT_2.load(Ordering::SeqCst);
             if steps > 1 {
-                // Jeśli zostało więcej niż 1 krok, dekrementujemy
                 STEPS_LEFT_2.store(steps - 1, Ordering::SeqCst);
             } else {
-                // Ostatni krok wykonany (lub było 0) -> Stop
                 tim2.cr1().modify(|_, w| w.cen().clear_bit());
-                // Ustawiamy na 0 dla porządku
                 STEPS_LEFT_2.store(0, Ordering::SeqCst);
             }
         }
     });
 }
-// Analogicznie dla TIM2...
